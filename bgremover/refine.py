@@ -18,6 +18,7 @@ from bgremover.morphology import dilate, erode, structuring_element
 
 __all__ = [
     "alpha_from_mask",
+    "guided_alpha_feathering",
     "decontaminate_edges",
     "compose_rgba",
     "upscale_mask",
@@ -119,9 +120,80 @@ def alpha_from_mask(
     return np.where(band, blurred, hard).astype(np.float32)
 
 
+def guided_alpha_feathering(
+    mask: np.ndarray,
+    radius: int = 4,
+) -> np.ndarray:
+    """Feather a mask with normalised spatial distance weighting.
+
+    A narrow transition band (``radius`` pixels each way, 3 to 5 in
+    practice) is drawn around the boundary; every band pixel gets
+    ``alpha = d_bg / (d_fg + d_bg)`` where ``d_fg``/``d_bg`` are the
+    distances to the sure foreground/background measured in
+    elliptical dilation layers.  Solid areas keep exact 0/1, the cut
+    edge itself maps to 0.5 and the ramp is monotone across the band,
+    so hair and silhouettes turn soft without a halo step.
+
+    Parameters
+    ----------
+    mask:
+        Boolean (or 0/1) array of shape ``(H, W)``.
+    radius:
+        Half-width of the transition band in pixels, at least 1.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``float32`` array of shape ``(H, W)`` in ``[0, 1]``.
+
+    Raises
+    ------
+    ValueError
+        For a bad mask or ``radius < 1``.
+    """
+    image = _as_bool_mask(mask)
+    band_width = int(radius)
+    if band_width < 1:
+        raise ValueError(f"radius must be >= 1, got {radius!r}")
+    element = structuring_element("disk", band_width)
+    sure_foreground = erode(image, kernel=element, border="reflect")
+    sure_background = ~dilate(image, kernel=element, border="reflect")
+    band = dilate(image, kernel=element, border="reflect") & ~erode(
+        image, kernel=element, border="reflect"
+    )
+    if not band.any():
+        return image.astype(np.float32)
+    if not sure_foreground.any():
+        sure_foreground = image
+    if not sure_background.any():
+        sure_background = ~image
+    far = float(band_width + 1)
+    foreground_distance = np.full(image.shape, far, dtype=np.float32)
+    background_distance = np.full(image.shape, far, dtype=np.float32)
+    for step in range(1, band_width + 1):
+        layer = structuring_element("disk", step)
+        reached = dilate(
+            sure_foreground, kernel=layer, border="reflect"
+        ).astype(bool)
+        fresh = band & reached & (foreground_distance > band_width)
+        foreground_distance[fresh] = float(step)
+        reached = dilate(
+            sure_background, kernel=layer, border="reflect"
+        ).astype(bool)
+        fresh = band & reached & (background_distance > band_width)
+        background_distance[fresh] = float(step)
+    alpha = image.astype(np.float32)
+    weight = background_distance[band] / (
+        foreground_distance[band] + background_distance[band]
+    )
+    alpha[band] = weight.astype(np.float32)
+    return np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+
 def decontaminate_edges(
     rgb: np.ndarray,
     alpha: np.ndarray,
+    max_distance: int | None = None,
 ) -> np.ndarray:
     """Push background halos out of semi-transparent edge pixels.
 
@@ -136,6 +208,9 @@ def decontaminate_edges(
         ``uint8`` RGB array of shape ``(H, W, 3)``.
     alpha:
         ``float32`` alpha matte of shape ``(H, W)`` in ``[0, 1]``.
+    max_distance:
+        Maximum propagation distance in pixels; ``None`` propagates
+        through the whole semi-transparent region.
 
     Returns
     -------
@@ -145,22 +220,31 @@ def decontaminate_edges(
     Raises
     ------
     ValueError
-        For a bad image or a mismatched alpha matte.
+        For a bad image, a mismatched alpha matte or a negative
+        ``max_distance``.
     """
     image = _as_rgb(rgb)
     matte = _as_alpha(alpha, image.shape[:2])
+    if max_distance is not None and int(max_distance) < 0:
+        raise ValueError(
+            f"max_distance must be >= 0, got {max_distance!r}"
+        )
+    limit = None if max_distance is None else int(max_distance)
     opaque = matte >= 1.0
     semi = (matte > 0.0) & ~opaque
     if not semi.any() or not opaque.any():
         return image.copy()
     height, width = matte.shape
     visited = opaque.copy()
+    distance = np.zeros(matte.shape, dtype=np.int32)
     result = image.copy()
     queue: deque[tuple[int, int]] = deque(
         map(tuple, np.argwhere(opaque).tolist())  # type: ignore[arg-type]
     )
     while queue:
         row, col = queue.popleft()
+        if limit is not None and distance[row, col] >= limit:
+            continue
         for delta_row, delta_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             next_row, next_col = row + delta_row, col + delta_col
             if not 0 <= next_row < height or not 0 <= next_col < width:
@@ -168,6 +252,7 @@ def decontaminate_edges(
             if visited[next_row, next_col] or not semi[next_row, next_col]:
                 continue
             visited[next_row, next_col] = True
+            distance[next_row, next_col] = distance[row, col] + 1
             result[next_row, next_col] = result[row, col]
             queue.append((next_row, next_col))
     return result

@@ -11,15 +11,19 @@ from bgremover.color import (
     background_distance_map,
     border_mask,
     estimate_background_model,
+    estimate_zoned_background_model,
     euclidean_color_distance,
     hsv_channel_images,
     hsv_slice,
     hsv_to_opencv_scale,
     hsv_to_rgb,
     lab_to_rgb,
+    perimeter_zones,
     rgb_to_hsi,
     rgb_to_hsv,
     rgb_to_lab,
+    saliency_foreground_seeds,
+    select_clean_zones,
 )
 from bgremover.config import PipelineConfig
 
@@ -309,3 +313,124 @@ def test_color_functions_reject_bad_input() -> None:
     with pytest.raises(ValueError):
         estimate_background_model(np.zeros((4, 4, 3), np.uint8),
                                   PipelineConfig(n_background_modes=3))
+
+
+def test_perimeter_zones_cover_the_frame() -> None:
+    """Sixteen zones tile the frame exactly once, corners on top/bottom."""
+    zones = perimeter_zones((120, 160), 6)
+    assert zones.shape == (120, 160)
+    assert zones.dtype == np.int32
+    assert sorted(map(int, np.unique(zones))) == list(range(17))
+    assert zones[0, 0] == 1
+    assert zones[0, 79] == 2
+    assert zones[60, 80] == 0
+    frame = border_mask((120, 160), 6)
+    assert np.array_equal(zones > 0, frame)
+    assert zones[59, 0] == 14
+    assert perimeter_zones((10, 10), 2, segments=2).max() == 8
+    with pytest.raises(ValueError):
+        perimeter_zones((10, 10), 0)
+    with pytest.raises(ValueError):
+        perimeter_zones((10, 10), 2, segments=0)
+    with pytest.raises(ValueError):
+        perimeter_zones((0, 10), 2)
+
+
+def test_select_clean_zones_discards_a_torso(rect_on_flat) -> None:
+    """Bottom zones crossed by edges (shoulders) are voted out."""
+    image, _ = rect_on_flat
+    height, width = image.shape[:2]
+    torso = image.copy()
+    torso[100:, 40:90] = (200, 30, 30)
+    zones = perimeter_zones((height, width), 5)
+    lab = rgb_to_lab(torso)
+    crossed = np.zeros((height, width), dtype=bool)
+    crossed[99, 40:90] = True
+    clean = select_clean_zones(lab, zones, crossed)
+    assert 6 not in clean and 7 not in clean
+    assert len(clean) >= 4
+    assert clean == sorted(clean)
+    assert select_clean_zones(lab, zones) == select_clean_zones(
+        lab, zones, np.zeros((height, width), dtype=bool)
+    )
+    with pytest.raises(ValueError):
+        select_clean_zones(lab, np.zeros((height, width), dtype=int))
+    with pytest.raises(ValueError):
+        select_clean_zones(lab, zones, np.zeros((4, 4), dtype=bool))
+    with pytest.raises(ValueError):
+        select_clean_zones(lab, zones, edge_frac=2.0)
+    with pytest.raises(ValueError):
+        select_clean_zones(np.zeros((4, 4, 3)), zones)
+
+
+def test_select_clean_zones_keeps_a_minimum() -> None:
+    """When every zone is crossed, the calmest zones still survive."""
+    lab = np.zeros((20, 20, 3), dtype=np.float32)
+    lab[:, :10] = (50.0, 0.0, 0.0)
+    lab[:, 10:] = (80.0, 0.0, 0.0)
+    zones = perimeter_zones((20, 20), 2)
+    edges = zones > 0
+    clean = select_clean_zones(lab, zones, edges, min_zones=4)
+    assert clean == [1, 2, 3, 4]
+
+
+def test_saliency_foreground_seeds(rect_on_flat,
+                                   circle_on_gradient) -> None:
+    """Central high-contrast pixels seed; background never does."""
+    for image, truth in (rect_on_flat, circle_on_gradient):
+        lab = rgb_to_lab(image)
+        mean = np.median(lab.reshape(-1, 3), axis=0)
+        seeds = saliency_foreground_seeds(lab, mean)
+        assert seeds.dtype == np.bool_
+        assert seeds.shape == truth.shape
+        assert float((seeds & truth).sum() / truth.sum()) > 0.9
+        assert int((seeds & ~truth).sum()) == 0
+    lab = rgb_to_lab(rect_on_flat[0])
+    with pytest.raises(ValueError):
+        saliency_foreground_seeds(lab, (1.0, 2.0))
+    with pytest.raises(ValueError):
+        saliency_foreground_seeds(lab, (50.0, 0.0, 0.0), contrast=0.0)
+    with pytest.raises(ValueError):
+        saliency_foreground_seeds(lab, (50.0, 0.0, 0.0), box_frac=1.5)
+    with pytest.raises(ValueError):
+        saliency_foreground_seeds(np.zeros((4, 4)), (50.0, 0.0, 0.0))
+
+
+def test_zoned_model_matches_plain_on_clean(circle_on_gradient) -> None:
+    """Without pollution the zoned model agrees with the plain one."""
+    image, _ = circle_on_gradient
+    cfg = PipelineConfig()
+    plain = estimate_background_model(image, cfg)
+    zoned = estimate_zoned_background_model(image, cfg)
+    assert zoned.modes.shape == plain.modes.shape
+    assert np.allclose(zoned.modes, plain.modes, atol=1.0)
+    assert zoned.n_samples > 0
+    assert len(zoned.hsv_median) == 3
+
+
+def test_zoned_model_ignores_a_border_torso(rect_on_flat) -> None:
+    """A red torso on the bottom edge must not enter the model."""
+    image, _ = rect_on_flat
+    height, width = image.shape[:2]
+    torso = image.copy()
+    torso[100:, 40:90] = (200, 30, 30)
+    crossed = np.zeros((height, width), dtype=bool)
+    crossed[99, 40:90] = True
+    model = estimate_zoned_background_model(
+        torso, PipelineConfig(), crossed
+    )
+    gray = np.array([225.0, 225.0, 225.0])
+    red = np.array([200.0, 30.0, 30.0])
+    for mode in model.modes:
+        assert float(np.linalg.norm(mode - rgb_to_lab(
+            gray.reshape(1, 1, 3)).ravel())) < 12.0
+        assert float(np.linalg.norm(mode - rgb_to_lab(
+            red.reshape(1, 1, 3)).ravel())) > 30.0
+    with pytest.raises(ValueError):
+        estimate_zoned_background_model(
+            torso, PipelineConfig(), np.zeros((4, 4), dtype=bool)
+        )
+    with pytest.raises(ValueError):
+        estimate_zoned_background_model(
+            torso, PipelineConfig(), np.zeros((height, width))
+        )

@@ -33,6 +33,7 @@ __all__ = [
     "log_edges",
     "canny",
     "canny_stages",
+    "combined_edge_response",
     "edge_barrier",
     "overlay_edges",
 ]
@@ -683,6 +684,71 @@ def canny(
         For a bad image, threshold, sigma or border mode.
     """
     return canny_stages(gray, low, high, sigma, border)["edges"]
+
+
+def combined_edge_response(
+    gray: np.ndarray,
+    low: float = 0.08,
+    high: float = 0.20,
+    sigma: float = 1.2,
+    border: str = "reflect",
+) -> np.ndarray:
+    """Fuse the Sobel magnitude with the Canny map into one barrier.
+
+    The Sobel magnitude of the Gaussian-smoothed image is normalised
+    to ``[0, 1]`` and max-fused with the binary Canny edge map, so
+    crisp silhouettes report ``1.0`` while soft tonal ramps keep their
+    graded response.  Region growing treats this map as an energy
+    barrier that background may not cross.
+
+    Parameters
+    ----------
+    gray:
+        2-D array of shape ``(H, W)``.
+    low, high:
+        Canny weak/strong thresholds as fractions of the maximum
+        thinned magnitude; ``0 < low < high <= 1``.
+    sigma:
+        Gaussian smoothing sigma in pixels; must be positive.
+    border:
+        Border handling, see :func:`bgremover.filters.pad_image`.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``float32`` array of shape ``(H, W)`` in ``[0, 1]``.
+
+    Raises
+    ------
+    ValueError
+        For a bad image, threshold, sigma or border mode.
+    """
+    image = _as_gray_float(gray)
+    low_ratio = _check_fraction("low", low)
+    high_ratio = _check_fraction("high", high)
+    if not low_ratio < high_ratio:
+        raise ValueError(
+            f"low ({low!r}) must be smaller than high ({high!r})"
+        )
+    deviation = float(sigma)
+    if deviation <= 0.0:
+        raise ValueError(f"sigma must be > 0, got {sigma!r}")
+    side = max(2 * int(np.ceil(3.0 * deviation)) + 1, 3)
+    smoothed = correlate2d(
+        image, gaussian_kernel(side, deviation), border
+    ).astype(np.float32)
+    magnitude = gradient_magnitude(
+        *gradients(smoothed, SOBEL_X, SOBEL_Y, border)
+    )
+    peak = float(magnitude.max())
+    if peak <= _NOISE_EPS:
+        graded = np.zeros(image.shape, dtype=np.float32)
+    else:
+        graded = (magnitude / peak).astype(np.float32)
+    strong = canny(
+        gray, low_ratio, high_ratio, deviation, border
+    ).astype(np.float32)
+    return np.maximum(graded, strong).astype(np.float32)
 
 
 def edge_barrier(edges: np.ndarray, radius: int = 1) -> np.ndarray:

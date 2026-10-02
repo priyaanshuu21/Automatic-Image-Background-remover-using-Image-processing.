@@ -22,6 +22,7 @@ __all__ = [
     "otsu_mask",
     "otsu_on_lightness",
     "region_growing",
+    "grow_background",
     "hysteresis_threshold",
     "region_means",
     "region_adjacency",
@@ -787,3 +788,155 @@ def describe_regions(labels: np.ndarray, name: str = "labels") -> str:
             )
         )
     return "\n".join(lines)
+
+
+def grow_background(
+    lab: np.ndarray,
+    seeds: object,
+    edge_strength: np.ndarray,
+    tolerance: float = 14.0,
+    max_edge: float = 0.12,
+    connectivity: int = 8,
+    allowed: np.ndarray | None = None,
+    reference: str = "seed",
+) -> np.ndarray:
+    """Grow the background from seeds through Lab colour and edges.
+
+    A candidate neighbour joins the background only when *both* hold:
+
+    a) its Euclidean Lab distance to the reference colour is not larger
+       than ``tolerance`` (perceptually uniform colour gate), and
+    b) its local edge energy is below ``max_edge``, so growth cannot
+       jump facial boundaries, skin/wall contours or clothing edges
+       even when the tones on both sides look alike.
+
+    Seeds themselves must satisfy the ``allowed`` mask and the edge
+    gate; a seed planted on a strong edge (a subject touching the
+    border) is dropped instead of leaking.  Traversal is breadth-first
+    and deterministic.
+
+    Parameters
+    ----------
+    lab:
+        Float Lab image of shape ``(H, W, 3)``.
+    seeds:
+        A flat index, a ``(row, col)`` pair, or an iterable of either.
+    edge_strength:
+        Float energy map of shape ``(H, W)`` in ``[0, 1]`` (see
+        :func:`bgremover.edges.combined_edge_response`); values are
+        clipped into range.
+    tolerance:
+        Maximum Lab distance to the reference colour.
+    max_edge:
+        Maximum admissible edge energy, in ``[0, 1]``.
+    connectivity:
+        4 or 8.
+    allowed:
+        Optional boolean mask; ``False`` pixels can never be added.
+    reference:
+        ``"seed"`` compares against the mean Lab of the accepted
+        seeds, ``"mean"`` against the running mean of the region.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean background mask of shape ``(H, W)``.
+
+    Raises
+    ------
+    ValueError
+        For a bad Lab image, seed notation, energy map, tolerance,
+        edge limit, connectivity, ``allowed`` or ``reference``.
+    """
+    field = np.asarray(lab, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 3 or field.size == 0:
+        raise ValueError(
+            f"expected a non-empty (H, W, 3) Lab image, "
+            f"got {field.shape}"
+        )
+    energy = np.asarray(edge_strength, dtype=np.float32)
+    if energy.shape != field.shape[:2]:
+        raise ValueError(
+            f"edge_strength shape {energy.shape} != image shape "
+            f"{field.shape[:2]}"
+        )
+    if not np.all(np.isfinite(energy)):
+        raise ValueError("edge_strength must be finite")
+    energy = np.clip(energy, 0.0, 1.0)
+    if float(tolerance) < 0.0:
+        raise ValueError(f"tolerance must not be negative, got {tolerance}")
+    edge_limit = float(max_edge)
+    if not 0.0 <= edge_limit <= 1.0:
+        raise ValueError(
+            f"max_edge must lie in [0, 1], got {max_edge!r}"
+        )
+    _check_connectivity(connectivity)
+    if reference not in ("seed", "mean"):
+        raise ValueError(f"reference must be seed or mean, got {reference!r}")
+    mask = np.zeros(field.shape[:2], dtype=bool)
+    if allowed is not None:
+        gate = np.asarray(allowed)
+        if gate.shape != field.shape[:2]:
+            raise ValueError(
+                f"allowed must have shape {field.shape[:2]}, "
+                f"got {gate.shape}"
+            )
+        gate = gate.astype(bool) if gate.dtype != np.bool_ else gate.copy()
+    else:
+        gate = np.ones(field.shape[:2], dtype=bool)
+
+    positions = _seed_positions(seeds, field.shape[:2])
+    if not positions:
+        return mask
+    offsets = neighbor_offsets(connectivity)
+    tolerance = float(tolerance)
+    accepted = [
+        (row, col) for row, col in positions
+        if gate[row, col] and energy[row, col] < edge_limit
+    ]
+    if not accepted:
+        return mask
+    if reference == "seed":
+        reference_value = np.mean(
+            [field[row, col] for row, col in accepted], axis=0
+        ).astype(np.float32)
+        total = np.zeros(3, dtype=np.float64)
+        count = 0.0
+    else:
+        reference_value = np.zeros(3, dtype=np.float32)
+        total = np.zeros(3, dtype=np.float64)
+        count = 0.0
+
+    queue: deque[tuple[int, int]] = deque()
+    for row, col in accepted:
+        if not mask[row, col]:
+            mask[row, col] = True
+            total += field[row, col].astype(np.float64)
+            count += 1.0
+            queue.append((row, col))
+    if reference == "mean" and count > 0:
+        reference_value = (total / count).astype(np.float32)
+    height, width = field.shape[:2]
+    while queue:
+        row, col = queue.popleft()
+        for delta_row, delta_col in offsets:
+            next_row, next_col = row + delta_row, col + delta_col
+            if not 0 <= next_row < height or not 0 <= next_col < width:
+                continue
+            if mask[next_row, next_col]:
+                continue
+            if not gate[next_row, next_col]:
+                continue
+            if energy[next_row, next_col] >= edge_limit:
+                continue
+            difference = field[next_row, next_col].astype(np.float64)
+            difference -= reference_value.astype(np.float64)
+            if float(np.linalg.norm(difference)) > tolerance:
+                continue
+            mask[next_row, next_col] = True
+            total += field[next_row, next_col].astype(np.float64)
+            count += 1.0
+            if reference == "mean":
+                reference_value = (total / count).astype(np.float32)
+            queue.append((next_row, next_col))
+    return mask

@@ -10,6 +10,7 @@ from bgremover.refine import (
     alpha_from_mask,
     compose_rgba,
     decontaminate_edges,
+    guided_alpha_feathering,
     upscale_mask,
 )
 
@@ -129,3 +130,47 @@ def test_upscale_mask() -> None:
         upscale_mask(np.zeros((4, 4), dtype=np.uint8), (8, 8))
     with pytest.raises(ValueError):
         upscale_mask(np.zeros((4, 4, 3), dtype=bool), (8, 8))
+
+
+def test_guided_alpha_feathering_ramps_monotonely() -> None:
+    """Solid areas stay 0/1 and the band rises evenly across the cut."""
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[:, 20:] = True
+    alpha = guided_alpha_feathering(mask, radius=4)
+    assert alpha.shape == mask.shape
+    assert alpha.dtype == np.float32
+    assert float(alpha.min()) >= 0.0 and float(alpha.max()) <= 1.0
+    assert float(alpha[20, 0]) == 0.0
+    assert float(alpha[20, 39]) == 1.0
+    ramp = alpha[20, 12:29]
+    assert bool((np.diff(ramp) >= 0.0).all())
+    assert float(ramp.min()) == 0.0 and float(ramp.max()) == 1.0
+    assert 0.0 < float(alpha[20, 19]) < 1.0
+    assert 0.0 < float(alpha[20, 20]) < 1.0
+    assert not guided_alpha_feathering(
+        np.zeros((8, 8), dtype=bool)
+    ).any()
+    assert guided_alpha_feathering(np.ones((8, 8), dtype=bool)).all()
+    thin = np.zeros((20, 20), dtype=bool)
+    thin[10, :] = True
+    assert np.isfinite(guided_alpha_feathering(thin)).all()
+    with pytest.raises(ValueError):
+        guided_alpha_feathering(mask, radius=0)
+    with pytest.raises(ValueError):
+        guided_alpha_feathering(np.zeros((8, 8, 3), dtype=bool))
+
+
+def test_decontaminate_max_distance_bounds_the_spill() -> None:
+    """Propagation stops after ``max_distance`` pixels from opaque."""
+    rgb = np.full((1, 8, 3), (10, 20, 200), dtype=np.uint8)
+    rgb[0, 0] = (220, 30, 30)
+    alpha = np.zeros((1, 8), dtype=np.float32)
+    alpha[0, 0] = 1.0
+    alpha[0, 1:] = 0.5
+    near = decontaminate_edges(rgb, alpha, max_distance=1)
+    assert (near[0, 1] == (220, 30, 30)).all()
+    assert (near[0, 2] == (10, 20, 200)).all()
+    everything = decontaminate_edges(rgb, alpha)
+    assert (everything[0, 1:] == (220, 30, 30)).all(axis=1).all()
+    with pytest.raises(ValueError):
+        decontaminate_edges(rgb, alpha, max_distance=-1)

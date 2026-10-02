@@ -9,8 +9,8 @@ transparent background. Every operator is implemented from scratch with NumPy
 and is verified against OpenCV as a reference oracle in the test suite.
 
 Status: released as **v1.0.0** — all ten implementation tasks are done
-(359 tests passing) and the full pipeline reaches IoU 1.0000 / 0.9958 on the
-synthetic fixtures.
+(388 tests passing) and the full pipeline reaches IoU 1.0000 / 1.0000 on the
+synthetic fixtures (studio mug 0.9995, portrait 0.8449, two-tone 0.9949).
 
 ## Setup
 
@@ -50,16 +50,23 @@ Launch the desktop front-end:
 ## How it works
 
 1. The image is resized to a working resolution and denoised.
-2. The border frame is sampled in CIELAB and reduced to one or two robust
-   background colour modes (median + MAD trimming).
+2. The border frame is split into 16 perimeter zones; zones crossed by
+   edges or with outlying colour variance are discarded, and the rest
+   are reduced to one or two robust CIELAB background modes.
 3. Every pixel's Lab distance to the background model forms a normalised
-   distance map; pixels past the halfway mark seed the foreground estimate.
-4. Canny edges (fractional double thresholds + hysteresis) become a barrier
-   that border-seeded region growing cannot cross.
-5. Barrier pixels the growth could not reach fall back to the colour model.
-6. The foreground mask is cleaned (small objects, holes, largest components),
-   feathered only inside a narrow boundary band, halo-decontaminated and
-   composited to RGBA at the original resolution.
+   distance map; Otsu on the non-denoised map seeds the foreground.
+4. Canny edges plus the normalised Sobel response form an energy
+   barrier; border-seeded region growing recruits a pixel only when its
+   Lab distance passes an adaptive threshold *and* its edge energy stays
+   below 0.12.
+5. Barrier-blocked pixels fall back to the colour model, smooth
+   shadow-like areas are absorbed through a chromatic gate, saliency
+   seeds confirm the subject interior, and topological solidification
+   force-fills every enclosed region.
+6. The foreground mask is cleaned (small objects, holes, largest
+   components), feathered by spatial-distance weighting inside a narrow
+   trimap band, halo-decontaminated and composited to RGBA at the
+   original resolution.
 
 See `docs/PIPELINE_STAGES.md` for the ten recorded intermediate stages and
 `docs/SYLLABUS_MAP.md` for how each image processing topic maps to a module.

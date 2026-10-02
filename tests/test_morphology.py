@@ -20,10 +20,12 @@ from bgremover.morphology import (
     opening,
     remove_objects_touching_border,
     remove_small_objects,
+    solidify_foreground,
     structuring_element,
     thickening,
     thinning,
     top_hat,
+    trimap_from_mask,
 )
 
 
@@ -243,3 +245,67 @@ def test_morphology_defaults() -> None:
     assert defaults["min_object_frac"] == cfg.min_object_frac
     assert defaults["fill_hole_frac"] == cfg.fill_hole_frac
     assert defaults["keep_largest"] == cfg.keep_largest
+
+
+def test_trimap_from_mask() -> None:
+    """Interior is sure foreground, far field sure background."""
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[8:32, 8:32] = True
+    trimap = trimap_from_mask(mask, radius=4)
+    assert trimap.shape == mask.shape
+    assert trimap.dtype == np.uint8
+    assert set(np.unique(trimap).tolist()) <= {0, 128, 255}
+    assert trimap[20, 20] == 255
+    assert trimap[0, 0] == 0
+    assert trimap[39, 39] == 0
+    assert 128 in trimap
+    band = trimap == 128
+    assert band[8, 8] or band[8, 20] or band[20, 8]
+    assert not trimap_from_mask(
+        np.zeros((8, 8), dtype=bool)
+    ).any()
+    assert trimap_from_mask(np.ones((8, 8), dtype=bool)).all()
+    with pytest.raises(ValueError):
+        trimap_from_mask(mask, radius=0)
+    with pytest.raises(ValueError):
+        trimap_from_mask(np.zeros((8, 8, 3), dtype=bool))
+
+
+def _donut() -> np.ndarray:
+    """A 24-pixel block with a 12-pixel enclosed hole."""
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[8:32, 8:32] = True
+    mask[14:26, 14:26] = False
+    return mask
+
+
+def test_solidify_fills_enclosed_holes() -> None:
+    """Hollow interiors become solid; the hull never removes pixels."""
+    solid = solidify_foreground(_donut())
+    assert solid.dtype == np.bool_
+    assert solid[8:32, 8:32].all()
+    assert not solidify_foreground(
+        np.zeros((8, 8), dtype=bool)
+    ).any()
+    assert solidify_foreground(np.ones((8, 8), dtype=bool)).all()
+    assert np.array_equal(solid, solidify_foreground(solid))
+
+
+def test_solidify_bridges_narrow_cuts() -> None:
+    """A blind 2-pixel crack is bridged before the hull is taken."""
+    cut = _donut()
+    cut[11:14, 18:20] = False
+    assert solidify_foreground(cut)[8:32, 8:32].all()
+
+
+def test_solidify_keeps_genuine_openings() -> None:
+    """A 12-pixel bay connected to the frame stays background."""
+    bay = _donut()
+    bay[8:14, 14:26] = False
+    assert not solidify_foreground(bay)[20, 20]
+    with pytest.raises(ValueError):
+        solidify_foreground(_donut(), close_radius=0)
+    with pytest.raises(ValueError):
+        solidify_foreground(_donut(), connectivity=6)
+    with pytest.raises(ValueError):
+        solidify_foreground(np.zeros((8, 8, 3), dtype=bool))

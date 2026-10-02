@@ -10,6 +10,7 @@ from bgremover.color import rgb_to_lab
 from bgremover.config import PipelineConfig
 from bgremover.segmentation import (
     describe_regions,
+    grow_background,
     hysteresis_threshold,
     merge_regions,
     merge_similar_regions,
@@ -329,3 +330,80 @@ def test_segmentation_defaults() -> None:
     assert defaults["hysteresis_low_ratio"] == cfg.hysteresis_low_ratio
     assert defaults["canny_low"] == cfg.canny_low
     assert defaults["canny_high"] == cfg.canny_high
+
+
+def _two_tone_lab() -> np.ndarray:
+    """Left/right halves 5 Lab units apart (inside one tolerance)."""
+    field = np.zeros((20, 30, 3), dtype=np.float32)
+    field[:, :15] = (50.0, 0.0, 0.0)
+    field[:, 15:] = (55.0, 0.0, 0.0)
+    return field
+
+
+def test_grow_background_leaks_without_a_barrier() -> None:
+    """Colour alone merges two similar tones from one seed."""
+    grown = grow_background(
+        _two_tone_lab(), [(10, 0)], np.zeros((20, 30), np.float32),
+        tolerance=14.0,
+    )
+    assert grown.dtype == np.bool_
+    assert grown.shape == (20, 30)
+    assert grown.all()
+
+
+def test_grow_background_respects_the_energy_gate() -> None:
+    """An edge ridge stops the leak even when colour would merge."""
+    energy = np.zeros((20, 30), dtype=np.float32)
+    energy[:, 14:16] = 1.0
+    grown = grow_background(
+        _two_tone_lab(), [(10, 0)], energy, tolerance=14.0
+    )
+    assert grown[:, 10].all()
+    assert not grown[:, 15:].any()
+    assert not grown[:, 14:16].any()
+
+
+def test_grow_background_seeds_on_edges_are_dropped() -> None:
+    """A seed planted on a strong edge never takes root."""
+    energy = np.zeros((20, 30), dtype=np.float32)
+    energy[10, 0] = 1.0
+    grown = grow_background(
+        _two_tone_lab(), [(10, 0)], energy, tolerance=14.0
+    )
+    assert not grown.any()
+    grown = grow_background(
+        _two_tone_lab(), [(10, 0), (0, 29)], energy, tolerance=14.0,
+        reference="mean",
+    )
+    assert grown[0, 29]
+
+
+def test_grow_background_validation() -> None:
+    """Bad Lab, energy, tolerance, gate and seeds are rejected."""
+    field = _two_tone_lab()
+    energy = np.zeros((20, 30), dtype=np.float32)
+    with pytest.raises(ValueError):
+        grow_background(np.zeros((20, 30)), [(0, 0)], energy)
+    with pytest.raises(ValueError):
+        grow_background(field, [(0, 0)], np.zeros((4, 4)))
+    with pytest.raises(ValueError):
+        grow_background(
+            field, [(0, 0)],
+            np.full((20, 30), np.inf, dtype=np.float32),
+        )
+    with pytest.raises(ValueError):
+        grow_background(field, [(0, 0)], energy, tolerance=-1.0)
+    with pytest.raises(ValueError):
+        grow_background(field, [(0, 0)], energy, max_edge=1.5)
+    with pytest.raises(ValueError):
+        grow_background(field, [(0, 0)], energy, connectivity=6)
+    with pytest.raises(ValueError):
+        grow_background(field, [(0, 0)], energy, reference="median")
+    with pytest.raises(ValueError):
+        grow_background(
+            field, [(0, 0)], energy,
+            allowed=np.zeros((4, 4), dtype=bool),
+        )
+    with pytest.raises(ValueError):
+        grow_background(field, [(99, 99)], energy)
+    assert not grow_background(field, [], energy).any()

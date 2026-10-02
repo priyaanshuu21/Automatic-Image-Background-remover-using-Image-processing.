@@ -29,6 +29,8 @@ __all__ = [
     "fill_holes",
     "remove_small_objects",
     "remove_objects_touching_border",
+    "trimap_from_mask",
+    "solidify_foreground",
     "morphology_defaults",
 ]
 
@@ -574,6 +576,111 @@ def remove_objects_touching_border(
     if not touching:
         return image.copy()
     return image & ~np.isin(labels, sorted(touching))
+
+
+def trimap_from_mask(mask: np.ndarray, radius: int = 4) -> np.ndarray:
+    """Split a binary mask into sure-foreground/band/sure-background.
+
+    The sure foreground is the mask eroded with a disc of ``radius``,
+    the sure background is everything outside the dilated mask, and
+    the narrow band between them (3 to 5 pixels wide in practice) is
+    the transition region where alpha feathering happens.
+
+    Parameters
+    ----------
+    mask:
+        Boolean (or 0/1) array of shape ``(H, W)``.
+    radius:
+        Half-width of the transition band in pixels, at least 1.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``uint8`` array of shape ``(H, W)`` holding ``255`` (sure
+        foreground), ``128`` (transition band) and ``0`` (sure
+        background).
+
+    Raises
+    ------
+    ValueError
+        For a non-binary mask or ``radius < 1``.
+    """
+    image = _as_binary(mask)
+    band = int(radius)
+    if band < 1:
+        raise ValueError(f"radius must be >= 1, got {radius!r}")
+    element = structuring_element("disk", band)
+    sure_foreground = erode(image, kernel=element, border="reflect")
+    sure_background = ~dilate(image, kernel=element, border="reflect")
+    trimap = np.full(image.shape, 128, dtype=np.uint8)
+    trimap[sure_foreground] = 255
+    trimap[sure_background] = 0
+    return trimap
+
+
+def _fill_enclosed(mask: np.ndarray, connectivity: int) -> np.ndarray:
+    """Fill the background components that never reach the frame."""
+    labels, _ = label_components(~mask, connectivity=connectivity)
+    touching = border_touching_labels(labels)
+    enclosed = labels > 0
+    if touching:
+        enclosed = enclosed & ~np.isin(labels, sorted(touching))
+    return mask | enclosed
+
+
+def solidify_foreground(
+    mask: np.ndarray,
+    close_radius: int = 5,
+    connectivity: int = 8,
+) -> np.ndarray:
+    """Close boundary breaks and force enclosed regions to foreground.
+
+    Real subjects must never be hollowed out: after an elliptical
+    closing (which bridges minor silhouette breaks) the background is
+    flood-filled strictly from the outer image frame, and every
+    region that does *not* touch the perimeter — hollow faces,
+    spectacle lenses, shirt patches — is forcefully marked as
+    foreground.  Closing and filling run at two scales (radius 2 and
+    ``close_radius``) so small and larger breaks are both sealed.
+
+    Parameters
+    ----------
+    mask:
+        Boolean (or 0/1) array of shape ``(H, W)``.
+    close_radius:
+        Elliptical closing radius in pixels, at least 1.
+    connectivity:
+        4 or 8, used when labelling the background.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean solid foreground hull of shape ``(H, W)``.
+
+    Raises
+    ------
+    ValueError
+        For a non-binary mask, ``close_radius < 1`` or a bad
+        connectivity.
+    """
+    image = _as_binary(mask)
+    if int(close_radius) < 1:
+        raise ValueError(
+            f"close_radius must be >= 1, got {close_radius!r}"
+        )
+    if connectivity not in (4, 8):
+        raise ValueError(
+            f"connectivity must be 4 or 8, got {connectivity!r}"
+        )
+    current = image
+    for step in sorted({2, int(close_radius)}):
+        current = closing(
+            current, kernel=structuring_element("disk", step)
+        ).astype(bool)
+        current = _fill_enclosed(current, connectivity)
+    # Solidification only ever adds pixels: the input silhouette itself
+    # is kept verbatim, so border-touching foreground is never trimmed.
+    return current | image
 
 
 def morphology_defaults(cfg: PipelineConfig) -> dict[str, int | float]:

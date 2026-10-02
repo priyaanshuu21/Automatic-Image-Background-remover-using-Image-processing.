@@ -659,6 +659,57 @@ def _kmeans(
     return centers, assignment
 
 
+def _fit_background_modes(
+    samples: np.ndarray,
+    n_modes: int,
+    trim_k: float,
+) -> tuple[list[np.ndarray], list[float], np.ndarray]:
+    """Fit one or two robust Gaussian colour modes to Lab samples.
+
+    Each mode is a Gaussian described by its median centre and its
+    MAD-based robust spread; samples further than ``median_distance +
+    trim_k * 1.4826 * MAD`` from a centre are trimmed away.
+
+    Parameters
+    ----------
+    samples:
+        ``(N, 3)`` array of Lab samples.
+    n_modes:
+        1 or 2 requested modes.
+    trim_k:
+        Trimming strength in robust standard deviations.
+
+    Returns
+    -------
+    tuple
+        The mode centres, their spreads and the kept samples.
+    """
+    centers: list[np.ndarray] = []
+    spreads: list[float] = []
+    kept_all: list[np.ndarray] = []
+    if int(n_modes) == 2 and samples.shape[0] >= 4:
+        _, assignment = _kmeans(samples, 2)
+        for index in range(2):
+            members = samples[assignment == index]
+            if members.shape[0] < 0.05 * samples.shape[0]:
+                continue
+            keep, spread = _trim(
+                members, np.median(members, axis=0), trim_k
+            )
+            kept = members[keep]
+            centers.append(np.median(kept, axis=0))
+            spreads.append(spread)
+            kept_all.append(kept)
+    if not centers:
+        center = np.median(samples, axis=0)
+        keep, spread = _trim(samples, center, trim_k)
+        kept = samples[keep]
+        centers.append(np.median(kept, axis=0))
+        spreads.append(spread)
+        kept_all.append(kept)
+    return centers, spreads, np.concatenate(kept_all, axis=0)
+
+
 def estimate_background_model(
     rgb: np.ndarray,
     cfg: PipelineConfig,
@@ -700,30 +751,9 @@ def estimate_background_model(
         raise ValueError("cannot sample the image border")
     hsv_all = rgb_to_hsv(array)[frame]
 
-    centers: list[np.ndarray] = []
-    spreads: list[float] = []
-    kept_all: list[np.ndarray] = []
-    if cfg.n_background_modes == 2 and samples.shape[0] >= 4:
-        initial, assignment = _kmeans(samples, 2)
-        for index in range(2):
-            members = samples[assignment == index]
-            if members.shape[0] < 0.05 * samples.shape[0]:
-                continue
-            keep, spread = _trim(members, np.median(members, axis=0),
-                                 cfg.trim_k)
-            kept = members[keep]
-            centers.append(np.median(kept, axis=0))
-            spreads.append(spread)
-            kept_all.append(kept)
-    if not centers:
-        center = np.median(samples, axis=0)
-        keep, spread = _trim(samples, center, cfg.trim_k)
-        kept = samples[keep]
-        centers.append(np.median(kept, axis=0))
-        spreads.append(spread)
-        kept_all.append(kept)
-
-    kept_samples = np.concatenate(kept_all, axis=0)
+    centers, spreads, kept_samples = _fit_background_modes(
+        samples, cfg.n_background_modes, cfg.trim_k
+    )
     distances = np.linalg.norm(
         samples - np.median(kept_samples, axis=0).reshape(1, 3), axis=1
     )
@@ -796,3 +826,387 @@ def background_distance_map(
     )
     return np.clip(distances.min(axis=0) / DISTANCE_NORM, 0.0,
                     1.0).astype(np.float32)
+
+
+def perimeter_zones(
+    shape: tuple[int, int],
+    thickness: int,
+    segments: int = 4,
+) -> np.ndarray:
+    """Divide the image border frame into labelled perimeter zones.
+
+    Each of the four edges is split into ``segments`` zones, giving
+    ``4 * segments`` zones in total (16 by default).  The top and
+    bottom bands span the full width (corners belong to them) while
+    the left and right bands cover only the middle rows, so no pixel
+    belongs to two zones.
+
+    Parameters
+    ----------
+    shape:
+        Target shape as ``(height, width)``.
+    thickness:
+        Frame width in pixels, at least 1.
+    segments:
+        Number of zones per edge, at least 1.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``int32`` array of shape ``shape`` holding ``0`` inside the
+        frame and zone ids ``1..4 * segments`` on the frame, ordered
+        top edge, bottom edge, right edge, left edge.
+
+    Raises
+    ------
+    ValueError
+        For a bad shape, thickness or segment count.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    band = int(thickness)
+    count = int(segments)
+    if height < 1 or width < 1:
+        raise ValueError(f"shape must hold values >= 1, got {shape!r}")
+    if band < 1:
+        raise ValueError(f"thickness must be >= 1, got {thickness!r}")
+    if count < 1:
+        raise ValueError(f"segments must be >= 1, got {segments!r}")
+    labels = np.zeros((height, width), dtype=np.int32)
+    rows = min(band, height)
+    cols = min(band, width)
+    zone = 1
+    for part in np.array_split(np.arange(width), count):
+        if part.size == 0:
+            continue
+        labels[:rows, part[0]:part[-1] + 1] = zone
+        zone += 1
+    for part in np.array_split(np.arange(width), count):
+        if part.size == 0:
+            continue
+        labels[height - rows:, part[0]:part[-1] + 1] = zone
+        zone += 1
+    middle = np.arange(rows, height - rows)
+    for part in np.array_split(middle, count):
+        if part.size == 0:
+            continue
+        labels[part[0]:part[-1] + 1, width - cols:] = zone
+        zone += 1
+    for part in np.array_split(middle, count):
+        if part.size == 0:
+            continue
+        labels[part[0]:part[-1] + 1, :cols] = zone
+        zone += 1
+    return labels
+
+
+def select_clean_zones(
+    lab: np.ndarray,
+    zones: np.ndarray,
+    edges: np.ndarray | None = None,
+    *,
+    edge_frac: float = 0.05,
+    variance_k: float = 2.0,
+    min_zones: int = 4,
+) -> list[int]:
+    """Keep the perimeter zones that look like plain background.
+
+    A zone is discarded when strong edges cross it (a subject touching
+    the border, e.g. shoulders at the bottom edge) or when its colour
+    variance is an outlier, i.e. above ``median + variance_k * 1.4826 *
+    MAD`` over the zones.  At least ``min_zones`` zones survive: when
+    too many are dirty, the calmest ones are kept.
+
+    Parameters
+    ----------
+    lab:
+        Float Lab image of shape ``(H, W, 3)``.
+    zones:
+        Integer zone labels of shape ``(H, W)`` as returned by
+        :func:`perimeter_zones` (``0`` means interior).
+    edges:
+        Optional boolean edge map of shape ``(H, W)``.
+    edge_frac:
+        Maximum admissible fraction of edge pixels inside a zone.
+    variance_k:
+        Outlier strength in robust standard deviations.
+    min_zones:
+        Minimum number of surviving zones.
+
+    Returns
+    -------
+    list of int
+        Sorted ids of the kept zones.
+
+    Raises
+    ------
+    ValueError
+        For bad shapes, a missing zone set or bad parameters.
+    """
+    field = np.asarray(lab, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 3:
+        raise ValueError(
+            f"expected an (H, W, 3) Lab image, got {field.shape}"
+        )
+    zone_ids = np.asarray(zones)
+    if zone_ids.shape != field.shape[:2]:
+        raise ValueError(
+            f"zones shape {zone_ids.shape} != image shape "
+            f"{field.shape[:2]}"
+        )
+    if edges is not None:
+        edge_map = np.asarray(edges)
+        if edge_map.dtype != np.bool_:
+            raise ValueError(
+                f"edges must be boolean, got {edge_map.dtype}"
+            )
+        if edge_map.shape != field.shape[:2]:
+            raise ValueError(
+                f"edges shape {edge_map.shape} != image shape "
+                f"{field.shape[:2]}"
+            )
+    else:
+        edge_map = np.zeros(field.shape[:2], dtype=bool)
+    limit = float(edge_frac)
+    if not 0.0 <= limit <= 1.0:
+        raise ValueError(
+            f"edge_frac must lie in [0, 1], got {edge_frac!r}"
+        )
+    strength = float(variance_k)
+    if strength < 0.0:
+        raise ValueError(
+            f"variance_k must be >= 0, got {variance_k!r}"
+        )
+    if int(min_zones) < 1:
+        raise ValueError(
+            f"min_zones must be >= 1, got {min_zones!r}"
+        )
+    present = sorted(int(value) for value in np.unique(zone_ids)
+                     if value > 0)
+    if not present:
+        raise ValueError("zones holds no perimeter zone")
+    variances: dict[int, float] = {}
+    crossings: dict[int, float] = {}
+    for zid in present:
+        pixels = field[zone_ids == zid]
+        if pixels.shape[0] == 0:
+            continue
+        variances[zid] = float(pixels.var(axis=0).mean())
+        crossings[zid] = float(edge_map[zone_ids == zid].mean())
+    if not variances:
+        raise ValueError("zones holds no sampled pixel")
+    values = np.array([variances[zid] for zid in variances])
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    ceiling = median + strength * MAD_SCALE * mad
+    kept = sorted(
+        zid for zid in variances
+        if crossings[zid] <= limit and variances[zid] <= ceiling
+    )
+    if len(kept) < int(min_zones):
+        ranked = sorted(
+            variances, key=lambda zid: (crossings[zid], variances[zid])
+        )
+        kept = sorted(ranked[:min(int(min_zones), len(ranked))])
+    return kept
+
+
+def saliency_foreground_seeds(
+    lab: np.ndarray,
+    background_mean: np.ndarray,
+    contrast: float = 12.0,
+    box_frac: float = 0.5,
+    chroma_contrast: float | None = None,
+) -> np.ndarray:
+    """Mark definite foreground seeds from a saliency prior.
+
+    Pixels inside the central ``box_frac`` bounding box whose Lab
+    distance to the background exceeds ``contrast`` are assumed to
+    belong to the subject: background visible there looks like the
+    perimeter, so anything sufficiently different must be salient.
+    Several background means (one per colour mode) may be given; the
+    distance to the *nearest* one counts, so no half of a two-tone
+    background ever looks salient.  When ``chroma_contrast`` is given,
+    the chromatic (a, b) distance to the nearest mode must exceed it
+    as well, which rejects smooth brightness-only variations such as
+    soft shadows while keeping truly colourful subjects.
+
+    Parameters
+    ----------
+    lab:
+        Float Lab image of shape ``(H, W, 3)``.
+    background_mean:
+        Length-3 Lab mean colour of the verified background, or a
+        ``(K, 3)`` array with one mean per background mode.
+    contrast:
+        Minimum Lab distance to count as salient; must be positive.
+    box_frac:
+        Relative side of the central box in ``(0, 1]``.
+    chroma_contrast:
+        Optional minimum chromatic distance to the nearest mode;
+        must be positive when given.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of shape ``(H, W)``.
+
+    Raises
+    ------
+    ValueError
+        For bad shapes or parameters.
+    """
+    field = np.asarray(lab, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 3:
+        raise ValueError(
+            f"expected an (H, W, 3) Lab image, got {field.shape}"
+        )
+    means = np.asarray(background_mean, dtype=np.float32)
+    if means.ndim == 1:
+        means = means.reshape(1, 3)
+    if means.ndim != 2 or means.shape[1] != 3 or means.shape[0] == 0:
+        raise ValueError(
+            f"background_mean must hold 3 values or be (K, 3), got shape "
+            f"{np.asarray(background_mean).shape}"
+        )
+    level = float(contrast)
+    if level <= 0.0:
+        raise ValueError(f"contrast must be > 0, got {contrast!r}")
+    chroma_level: float | None = None
+    if chroma_contrast is not None:
+        chroma_level = float(chroma_contrast)
+        if chroma_level <= 0.0:
+            raise ValueError(
+                f"chroma_contrast must be > 0, got {chroma_contrast!r}"
+            )
+    fraction = float(box_frac)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(
+            f"box_frac must lie in (0, 1], got {box_frac!r}"
+        )
+    height, width = field.shape[:2]
+    margin_h = int(round(height * (1.0 - fraction) / 2.0))
+    margin_w = int(round(width * (1.0 - fraction) / 2.0))
+    inner = np.zeros((height, width), dtype=bool)
+    inner[margin_h:height - margin_h or height,
+          margin_w:width - margin_w or width] = True
+    if not inner.any():
+        inner[:, :] = True
+    distances = np.min(
+        np.stack(
+            [
+                np.linalg.norm(field - mode.reshape(1, 1, 3), axis=2)
+                for mode in means
+            ],
+            axis=0,
+        ),
+        axis=0,
+    )
+    salient = inner & (distances > level)
+    if chroma_level is not None:
+        chromatic = np.min(
+            np.stack(
+                [
+                    np.linalg.norm(
+                        field[..., 1:] - mode.reshape(1, 1, 2), axis=2
+                    )
+                    for mode in means[:, 1:]
+                ],
+                axis=0,
+            ),
+            axis=0,
+        )
+        salient = salient & (chromatic > chroma_level)
+    return salient
+
+
+def estimate_zoned_background_model(
+    rgb: np.ndarray,
+    cfg: PipelineConfig,
+    edges: np.ndarray | None = None,
+) -> BackgroundModel:
+    """Fit the background model on verified clean perimeter zones.
+
+    The border frame is split into 16 zones by
+    :func:`perimeter_zones`; zones crossed by edges or with outlying
+    colour variance are discarded by :func:`select_clean_zones`, so a
+    torso touching the bottom edge or shoulders crossing the sides can
+    no longer drag the model.  The surviving samples are reduced to
+    one or two Gaussian modes (median centre, MAD-based spread) with
+    the same deterministic fitting as :func:`estimate_background_model`.
+
+    Parameters
+    ----------
+    rgb:
+        ``uint8`` RGB image.
+    cfg:
+        Validated :class:`~bgremover.config.PipelineConfig`.
+    edges:
+        Optional boolean edge map of the same height and width; zones
+        crossed by edges are discarded.
+
+    Returns
+    -------
+    BackgroundModel
+        The Lab centres, their robust spreads, the number of kept
+        samples and the median HSV of the kept samples.
+
+    Raises
+    ------
+    ValueError
+        If the image, the edges or the configuration is invalid.
+    """
+    array = _as_rgb(rgb)
+    cfg.validate()
+    height, width = array.shape[:2]
+    thickness = max(1, round(cfg.border_frac * min(height, width)))
+    zones = perimeter_zones((height, width), thickness)
+    lab_all = rgb_to_lab(array)
+    if edges is not None:
+        edge_map = np.asarray(edges)
+        if edge_map.dtype != np.bool_:
+            raise ValueError(
+                f"edges must be boolean, got {edge_map.dtype}"
+            )
+        if edge_map.shape != (height, width):
+            raise ValueError(
+                f"edges shape {edge_map.shape} != image shape "
+                f"{(height, width)}"
+            )
+    else:
+        edge_map = np.zeros((height, width), dtype=bool)
+    clean = select_clean_zones(lab_all, zones, edge_map)
+    selected = np.isin(zones, clean)
+    samples = lab_all[selected]
+    hsv_all = rgb_to_hsv(array)[selected]
+    if samples.shape[0] < 16:
+        LOGGER.debug("zoned sampling too small; using full frame")
+        frame = border_mask((height, width), thickness)
+        samples = lab_all[frame]
+        hsv_all = rgb_to_hsv(array)[frame]
+        if samples.size == 0:
+            raise ValueError("cannot sample the image border")
+    centers, spreads, kept_samples = _fit_background_modes(
+        samples, cfg.n_background_modes, cfg.trim_k
+    )
+    distances = np.linalg.norm(
+        samples - np.median(kept_samples, axis=0).reshape(1, 3), axis=1
+    )
+    kept_mask = distances <= float(np.max(spreads)) * 2.0 + 2.0
+    hsv_kept = hsv_all[kept_mask]
+    if hsv_kept.size == 0:
+        hsv_kept = hsv_all
+    LOGGER.debug(
+        "zoned background model: %d mode(s) from %d samples",
+        len(centers),
+        kept_samples.shape[0],
+    )
+    return BackgroundModel(
+        modes=np.stack(centers, axis=0).astype(np.float32),
+        spreads=np.array(spreads, dtype=np.float32),
+        n_samples=int(kept_samples.shape[0]),
+        hsv_median=(
+            float(np.median(hsv_kept[:, 0])),
+            float(np.median(hsv_kept[:, 1])),
+            float(np.median(hsv_kept[:, 2])),
+        ),
+    )

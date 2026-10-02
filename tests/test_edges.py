@@ -15,6 +15,7 @@ from bgremover.edges import (
     SOBEL_Y,
     canny,
     canny_stages,
+    combined_edge_response,
     edge_barrier,
     gradient_direction,
     gradient_magnitude,
@@ -367,3 +368,34 @@ def test_overlay_edges_paints_only_edges(rect_image) -> None:
         overlay_edges(rect_image, edges.astype(np.uint8))
     with pytest.raises(ValueError):
         overlay_edges(rect_image, edges, color=(256, 0, 0))
+
+
+def test_combined_edge_response_is_normalised() -> None:
+    """The fused map spans [0, 1] and peaks on crisp silhouettes."""
+    gray = _step()
+    response = combined_edge_response(gray)
+    assert response.shape == gray.shape
+    assert response.dtype == np.float32
+    assert float(response.min()) >= 0.0
+    assert float(response.max()) <= 1.0
+    assert float(response.max()) == pytest.approx(1.0)
+    band = np.zeros_like(response, dtype=bool)
+    band[:, 22:26] = True
+    assert float(response[band].max()) > 0.5
+    assert not combined_edge_response(
+        np.full((16, 16), 90, dtype=np.uint8)
+    ).any()
+
+
+def test_combined_edge_response_covers_canny() -> None:
+    """Every Canny pixel reports full energy in the fused map."""
+    gray = _step()
+    response = combined_edge_response(gray)
+    strong = canny(gray)
+    assert bool((response[strong] >= 1.0).all())
+    with pytest.raises(ValueError):
+        combined_edge_response(gray, low=0.5, high=0.2)
+    with pytest.raises(ValueError):
+        combined_edge_response(gray, sigma=0.0)
+    with pytest.raises(ValueError):
+        combined_edge_response(np.zeros((8, 8, 3), dtype=np.uint8))
