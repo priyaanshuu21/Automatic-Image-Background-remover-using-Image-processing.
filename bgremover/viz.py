@@ -20,6 +20,7 @@ import numpy as np
 __all__ = [
     "checkerboard",
     "composite_over_checkerboard",
+    "stage_to_rgb",
     "save_stage_grid",
 ]
 
@@ -97,8 +98,28 @@ def composite_over_checkerboard(
     return np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
 
 
-def _stage_to_rgb(stage: np.ndarray) -> np.ndarray:
-    """Render any pipeline stage as a ``uint8`` RGB preview."""
+def stage_to_rgb(stage: np.ndarray) -> np.ndarray:
+    """Render any pipeline stage as a ``uint8`` RGB preview.
+
+    Boolean masks become black/white, float images are scaled from
+    ``[0, 1]``, gray and RGB images pass through and RGBA images are
+    composited over a checkerboard.
+
+    Parameters
+    ----------
+    stage:
+        A ``bool``, float, gray, RGB or RGBA array.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``uint8`` RGB array of the same height and width.
+
+    Raises
+    ------
+    ValueError
+        For an unrenderable shape or dtype.
+    """
     array = np.asarray(stage)
     if array.ndim == 3 and array.shape[2] == 4 and array.dtype == np.uint8:
         return composite_over_checkerboard(array)
@@ -167,7 +188,7 @@ def save_stage_grid(
         axis.axis("off")
         if index >= count:
             continue
-        axis.imshow(_stage_to_rgb(stages[names[index]]))
+        axis.imshow(stage_to_rgb(stages[names[index]]))
         axis.set_title(names[index], fontsize=9)
     figure.tight_layout()
     destination = Path(path)
