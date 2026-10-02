@@ -1,0 +1,46 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Generated / temporary output
+outputs/
+output/
+results/
+tmp/
+*.log
+
+# Generated images
+samples/generated/
+docs/figures/generated/
+
+# Local, never-committed release notes
+docs/PUSH_STATUS.md
+
+!samples/.gitkeep
