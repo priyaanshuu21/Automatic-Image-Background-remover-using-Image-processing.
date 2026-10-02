@@ -6,6 +6,7 @@
 | 01 | Done | 2026-10-02 | `config.py` (validated frozen `PipelineConfig`), `io.py` (Pillow I/O), `fundamentals.py` (gray conversion, channels, resampling, quantization, resizing), synthetic fixtures, `make_samples.py`, `verify.ps1`, architecture guard. `pytest -q` = 106 passed. |
 | 02 | Done | 2026-10-02 | `pixels.py` (neighbourhoods, D4/D8/euclidean distances, two-pass union-find labelling verified against `cv2.connectedComponents`, component stats, ASCII neighbourhood demo) and `point_ops.py` (LUT-based negative, stretch, threshold, slice, log, power law). `pytest -q` = 157 passed. |
 | 03 | Done | 2026-10-02 | `filters.py` (padding, correlation/convolution, box and separable Gaussian kernels, median, unsharp, Laplacian, `denoise` dispatch) and `histogram.py` (histogram, CDF, equalisation, per-channel colour histograms, hue-preserving value equalisation, statistics). Gaussian and median filters verified against OpenCV. `pytest -q` = 206 passed. |
+| 04 | Done | 2026-10-02 | `color.py` (RGB to HSV/HSI/CIELAB conversions, HSV to RGB, Lab to RGB, Euclidean/Delta E distance, wrap-around HSV slicing, deterministic trimmed-cluster border background model, normalised distance map, `border_mask`). HSV verified against `cv2.COLOR_RGB2HSV_FULL` and Lab against `cv2.COLOR_RGB2Lab`, both within one unit. `pytest -q` = 232 passed. |
 
 ## Environment notes (Task 00)
 
