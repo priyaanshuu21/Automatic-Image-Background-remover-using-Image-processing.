@@ -3,6 +3,7 @@
 | Task | Status | Date | Notes |
 |------|--------|------|-------|
 | 00 | Done | 2026-10-02 | Workspace inspection, virtual environment, tooling config, git remote. `ruff check .` clean, `pytest -q` = 1 passed. |
+| 01 | Done | 2026-10-02 | `config.py` (validated frozen `PipelineConfig`), `io.py` (Pillow I/O), `fundamentals.py` (gray conversion, channels, resampling, quantization, resizing), synthetic fixtures, `make_samples.py`, `verify.ps1`, architecture guard. `pytest -q` = 106 passed. |
 
 ## Environment notes (Task 00)
 
