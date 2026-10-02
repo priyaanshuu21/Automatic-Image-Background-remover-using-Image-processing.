@@ -12,6 +12,7 @@
 | 07 | Done | 2026-10-02 | `edges.py` (Sobel/Prewitt/Laplacian/LoG kernels, gradients, magnitude/direction, Sobel/Prewitt edges, Laplacian/LoG zero crossings, Canny with vectorised NMS/double-threshold/hysteresis, edge barrier, edge overlay). Sobel/Laplacian verified exactly against OpenCV; Canny runs in ~25 ms on fixtures. `pytest -q` = 296 passed. |
 | 08 | Done | 2026-10-02 | `refine.py` (band-limited alpha feathering, BFS halo decontamination, RGBA compositing, mask upscaling), `pipeline.py` (`BackgroundRemovalPipeline`/`PipelineResult` with 10 stage keys: input/resized/denoised/distance/edges/seed_mask/grown_mask/cleaned_mask/alpha/rgba), `viz.py` (Agg checkerboard/stage-grid rendering), `scripts/run_demo.py` (IoU 1.0000 circle, 0.9958 rect). Barrier-blocked pixels fall back to the colour model. `pytest -q` = 326 passed. |
 | 09 | Done | 2026-10-02 | `transforms.py` (2D DFT/IDFT, log magnitude spectrum, orthonormal DCT-II, Sylvester Hadamard; decoupled from the pipeline), `cli.py` (`remove`/`batch`/`stages`/`analyze`/`info` subcommands), `gui_controller.py` (headless app logic) + `gui.py` (thin Tk view, never opens windows in tests). `pytest -q` = 359 passed. |
+| 10 | Done | 2026-10-02 | Release 1.0.0: completed `README.md`, `docs/SYLLABUS_MAP.md`, `docs/PIPELINE_STAGES.md`; bumped `bgremover.__version__` to 1.0.0; fresh-venv verification green; tagged `v1.0.0`. |
 
 ## Environment notes (Task 00)
 
